@@ -126,7 +126,6 @@ static int vsound_pcm_open(struct snd_pcm_substream *substream)
 	LOG("OPEN");
 	struct snd_vsound *vsound = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-
 	/*
 	 * If the backend_model has been updated, apply the changes to pcm_hw.
 	 * The backend_model is updated through ioctl.
@@ -164,18 +163,23 @@ static int vsound_pcm_prepare(struct snd_pcm_substream *substream)
 	/* In this callback, it can refer to runtime record */
 
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	act.substream	= substream;
+	act.tail	= 0;
+	act.size	= 0;
+	act.state_change_notify = false;
 	pcm.state	= runtime->_STATE_;
+
+	/* If there are any changes in sample rate or other parameters, set the notification flag. */
+	if (pcm.format != runtime->format
+		|| pcm.rate != runtime->rate
+		|| pcm.channels != runtime->channels) {
+		act.state_change_notify = true;
+	}
 	pcm.format	= runtime->format;
 	pcm.rate	= runtime->rate;
 	pcm.channels	= runtime->channels;
+
 	pcm.buffer_bytes = frames_to_bytes(runtime, runtime->buffer_size);
-
-	/* act.substream should be read from aoecli, so update it last. */
-	act.tail	= 0;
-	act.size	= 0;
-	act.state_change_notify = true;
-	act.substream	= substream;
-
 	LOG("%s %u %u", snd_pcm_format_name(runtime->format), runtime->rate, runtime->channels);
 	LOG("period_size:%lu (%ldB) periods:%u buffer_size:%lu (%ldB) frame_bits:%u dma_bytes:%lu",
 		runtime->period_size, frames_to_bytes(runtime, runtime->period_size),
@@ -438,9 +442,10 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 {
 	/* read stats, return avail bytes */
 	if (count == 0) {
+		copy_to_user(buf, &pcm, sizeof(struct vsound_pcm));
+
 		/* Once the status reading is executed, release the notify flag. */
 		act.state_change_notify = false;
-		copy_to_user(buf, &pcm, sizeof(struct vsound_pcm));
 
 		if (act.substream) {
 			struct snd_pcm_runtime *runtime = act.substream->runtime;
@@ -452,8 +457,11 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 		}
 	}
 
+	if (act.state_change_notify)
+		return -EINVAL;
+
 	/* buffer read */
-	if (act.substream == NULL || act.state_change_notify)
+	if (act.substream == NULL)
 		return -EAGAIN;
 
 	struct snd_pcm_runtime *runtime = act.substream->runtime;
@@ -466,9 +474,6 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 		return -EAGAIN;
 	}
 
-	unsigned long flags;
-	snd_pcm_stream_lock_irqsave(act.substream, flags);
-
 	/* buffer check */
 	unsigned int tail = act.tail;
 	unsigned int buffer_bytes = frames_to_bytes(runtime, runtime->buffer_size);
@@ -477,7 +482,6 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 	if (likely(avail > 0)) {
 		avail = frames_to_bytes(runtime, avail);
 	} else {
-		snd_pcm_stream_unlock_irqrestore(act.substream, flags);
 		if (runtime->_STATE_ == SNDRV_PCM_STATE_DRAINING) {
 			return 0;
 		} else {
@@ -501,8 +505,6 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 
 	/* period elapsed */
 	act.size += bytes_to_frames(runtime, count);
-	snd_pcm_stream_unlock_irqrestore(act.substream, flags);
-
 	if (act.size >= runtime->period_size) {
 		act.size %= runtime->period_size;
 		snd_pcm_period_elapsed(act.substream);
