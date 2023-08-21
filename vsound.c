@@ -89,10 +89,9 @@ static struct vsound_model backend_model = (struct vsound_model){ 0 };
 
 /* default model */
 static const struct snd_pcm_hardware vsound_pcm_hardware = {
-	.info =			(SNDRV_PCM_INFO_MMAP |
-				 SNDRV_PCM_INFO_INTERLEAVED |
-				 SNDRV_PCM_INFO_RESUME |
-				 SNDRV_PCM_INFO_MMAP_VALID),
+//	.info =			(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+//				 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
+	.info =			(SNDRV_PCM_INFO_INTERLEAVED),
 	.formats =		SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates =		(SNDRV_PCM_RATE_44100|SNDRV_PCM_RATE_48000|
 				SNDRV_PCM_RATE_88200|SNDRV_PCM_RATE_96000|
@@ -151,16 +150,22 @@ static int vsound_pcm_open(struct snd_pcm_substream *substream)
 static int vsound_pcm_hw_params(struct snd_pcm_substream *substream,
 			       struct snd_pcm_hw_params *hw_params)
 {
+	/* non-atomic (schedulable) */
 	/* this callback may be called multiple times */
 	pcm.state	= substream->runtime->_STATE_;
-	return  snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0))
+	return 0;
+#else
+	return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
+#endif
 }
 
 static int vsound_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	LOG("PREPARE");
-	/* this callback may be called multiple times */
-	/* In this callback, it can refer to runtime record */
+	/* non-atomic (schedulable) */
+	/* this callback may be called multiple times. */
+	/* In this callback, it can refer to runtime record. */
 
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	act.substream	= substream;
@@ -191,11 +196,11 @@ static int vsound_pcm_prepare(struct snd_pcm_substream *substream)
 
 static int vsound_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	/* In this callback, it can refer to runtime record */
-	/* this callback is atomic, it cannot call functions which may sleep */
-	/* trigger callback should be as minimal as possible */
+	/* atomic (it cannot call functions which may sleep) */
+	/* In this callback, it can refer to runtime record. */
+	/* trigger callback should be as minimal as possible. */
 
-	pcm.state = substream->runtime->_STATE_;
+//	pcm.state = substream->runtime->_STATE_;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -210,10 +215,10 @@ static int vsound_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 static snd_pcm_uframes_t vsound_pcm_pointer(struct snd_pcm_substream *substream)
 {
-	/* return current hardware position on the buffer. */
+	/* Return current hardware position on the buffer. */
 	/* The position must be returned in frames. (0 to buffer_size - 1) */
-	/* this callback is atomic, it cannot call functions which may sleep */
-
+	/* This callback is atomic, it cannot call functions which may sleep. */
+	/* This is invoked when snd_pcm_period_elapsed() is called. */
 	return bytes_to_frames(act.substream->runtime, act.tail);
 }
 
@@ -268,14 +273,15 @@ static int snd_card_vsound_pcm(struct snd_vsound *vsound, int device,
 	struct snd_pcm_ops *ops;
 	int err;
 
-	err = snd_pcm_new(vsound->card, "AoE VSOUND", 0,
-			       1, 0, &sndpcm);
+	/* index = 0 and playback only */
+	err = snd_pcm_new(vsound->card, "AoE VSOUND", 0, 1, 0, &sndpcm);
 	if (err < 0)
 		return err;
 	vsound->pcm = sndpcm;
 	ops = &vsound_pcm_ops;
 	snd_pcm_set_ops(sndpcm, SNDRV_PCM_STREAM_PLAYBACK, ops);
 
+	/* pre-allocation of buffers */
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0))
 	snd_pcm_set_managed_buffer_all(sndpcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 #else
@@ -442,23 +448,23 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 {
 	/* read stats, return avail bytes */
 	if (count == 0) {
-		copy_to_user(buf, &pcm, sizeof(struct vsound_pcm));
 
 		/* Once the status reading is executed, release the notify flag. */
 		act.state_change_notify = false;
 
+		ssize_t ret = 0;
 		if (act.substream) {
 			struct snd_pcm_runtime *runtime = act.substream->runtime;
 			snd_pcm_sframes_t avail = snd_pcm_playback_hw_avail(runtime);
-			return frames_to_bytes(runtime, avail);
-
-		} else {
-			return 0;
+			ret = frames_to_bytes(runtime, avail);
+			pcm.state = runtime->_STATE_;
 		}
+		copy_to_user(buf, &pcm, sizeof(struct vsound_pcm));
+		return ret;
 	}
 
 	if (act.state_change_notify)
-		return -EINVAL;
+		return -ECANCELED;
 
 	/* buffer read */
 	if (act.substream == NULL)
