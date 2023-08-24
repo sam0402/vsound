@@ -434,7 +434,6 @@ static void snd_vsound_unregister_all(void)
 #include <asm/uaccess.h>   /* copy_from_user, copy_to_user */
 #include <linux/cdev.h>
 #define DEVICE_NAME	"vsound"
-DECLARE_WAIT_QUEUE_HEAD(read_q);
 static dev_t start;
 static int major, minor;
 static struct cdev* chardev = NULL;
@@ -463,20 +462,17 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 		return ret;
 	}
 
+	/* buffer read */
 	if (act.state_change_notify)
 		return -ECANCELED;
 
-	/* buffer read */
 	if (act.substream == NULL)
 		return -EAGAIN;
 
 	struct snd_pcm_runtime *runtime = act.substream->runtime;
 	/* state check */
 	if (runtime->_STATE_ != SNDRV_PCM_STATE_RUNNING &&
-		runtime->_STATE_ != SNDRV_PCM_STATE_PREPARED &&
 		runtime->_STATE_ != SNDRV_PCM_STATE_DRAINING) {
-		LOG("Rejected with a quick check ...state:%s(%u)",
-			snd_pcm_state_name(runtime->_STATE_), runtime->_STATE_);
 		return -EAGAIN;
 	}
 
