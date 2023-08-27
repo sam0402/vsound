@@ -2,6 +2,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -122,7 +123,9 @@ static const struct snd_pcm_hardware vsound_pcm_hardware = {
  */
 static int vsound_pcm_open(struct snd_pcm_substream *substream)
 {
-	LOG("OPEN");
+	memcpy(pcm.comm, current->comm, sizeof(pcm.comm));
+	LOG("OPEN (id:%d vid:%d %s)", (int)task_pid_nr(current), (int)task_pid_vnr(current), pcm.comm);
+
 	struct snd_vsound *vsound = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	/*
@@ -162,12 +165,12 @@ static int vsound_pcm_hw_params(struct snd_pcm_substream *substream,
 
 static int vsound_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	LOG("PREPARE");
 	/* non-atomic (schedulable) */
 	/* this callback may be called multiple times. */
 	/* In this callback, it can refer to runtime record. */
 
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	LOG("PREPARE (%d)", runtime->_STATE_);
 	act.substream	= substream;
 	act.tail	= 0;
 	act.size	= 0;
@@ -230,10 +233,16 @@ static int vsound_pcm_hw_free(struct snd_pcm_substream *substream)
 	act.size	= 0;
 	act.state_change_notify = false;
 	pcm.state	= substream->runtime->_STATE_;
-	pcm.format	= 0;
-	pcm.rate	= 0;
-	pcm.channels	= 0;
-	pcm.buffer_bytes = 0;
+
+	/* Some playback software may perform CLOSE and then reOPEN between songs.
+	 * In this case, if there are no changes in format or sample rate,
+	 * there is no need for notification to aoecli. Therefore, initialization of format,
+	 * sample rate, and channels will not be performed. */
+//	pcm.format	= 0;
+//	pcm.rate	= 0;
+//	pcm.channels	= 0;
+//	pcm.buffer_bytes = 0;
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0))
 	return 0;
 #else
@@ -529,10 +538,9 @@ static long vsound_buffer_ioctl(struct file *filp, unsigned int cmd, unsigned lo
 			/* pcm stop */
 			snd_pcm_stream_lock_irqsave(act.substream, flags);
 			if (snd_pcm_running(act.substream)) {
-				snd_pcm_stop(act.substream, SNDRV_PCM_STATE_DRAINING);
+				snd_pcm_stop(act.substream, SNDRV_PCM_STATE_DISCONNECTED);
 			}
 			snd_pcm_stream_unlock_irqrestore(act.substream, flags);
-			snd_pcm_period_elapsed(act.substream);
 		}
 		break;
 	case IOCTL_VSOUND_APPLY_MODEL:

@@ -10,6 +10,7 @@ struct vsound_pcm {
 	unsigned int period_us;		/* period time (us), server only used */
 	ssize_t buffer_bytes;
 	uint32_t mixer_value;
+	char comm[16];				/* command name (linux/sched.h) */
 };
 
 struct vsound_model {
