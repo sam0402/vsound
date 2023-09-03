@@ -1,6 +1,7 @@
 #include <linux/version.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <sound/core.h>
@@ -49,6 +50,12 @@ static int periods_min = 4;
 module_param(period_bytes_min, int, S_IRUSR | S_IWUSR);
 module_param(periods_min, int, S_IRUSR | S_IWUSR);
 
+/* debug info */
+static unsigned long xrun_count;
+module_param(xrun_count, ulong, S_IRUSR);
+static unsigned long drain_count;
+module_param(drain_count, ulong, S_IRUSR);
+
 /* logging */
 #ifdef DEBUG_VSOUND
 #define LOG(fmt, ...) printk(KERN_INFO fmt, ##__VA_ARGS__)
@@ -88,11 +95,16 @@ static struct active_buffer act;
 static struct vsound_pcm pcm;
 static struct vsound_model backend_model = (struct vsound_model){ 0 };
 
+static void period_elapsed_func(struct work_struct *work)
+{
+	if (act.substream)
+		snd_pcm_period_elapsed(act.substream);
+}
+static DECLARE_WORK(period_elapsed_work, period_elapsed_func);
+
 /* default model */
 static const struct snd_pcm_hardware vsound_pcm_hardware = {
-//	.info =			(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
-//				 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
-	.info =			(SNDRV_PCM_INFO_INTERLEAVED),
+	.info =			(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP_VALID),
 	.formats =		SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates =		(SNDRV_PCM_RATE_44100|SNDRV_PCM_RATE_48000|
 				SNDRV_PCM_RATE_88200|SNDRV_PCM_RATE_96000|
@@ -170,7 +182,7 @@ static int vsound_pcm_prepare(struct snd_pcm_substream *substream)
 	/* In this callback, it can refer to runtime record. */
 
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	LOG("PREPARE (%d)", runtime->_STATE_);
+	LOG("PREPARE (%d) drain:%ld xrun:%ld", runtime->_STATE_, drain_count, xrun_count);
 	act.substream	= substream;
 	act.tail	= 0;
 	act.size	= 0;
@@ -222,17 +234,20 @@ static snd_pcm_uframes_t vsound_pcm_pointer(struct snd_pcm_substream *substream)
 	/* The position must be returned in frames. (0 to buffer_size - 1) */
 	/* This callback is atomic, it cannot call functions which may sleep. */
 	/* This is invoked when snd_pcm_period_elapsed() is called. */
-	return bytes_to_frames(act.substream->runtime, act.tail);
+	return bytes_to_frames(substream->runtime, act.tail);
 }
 
 static int vsound_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	LOG("HW FREE");
+	cancel_work_sync(&period_elapsed_work);
+
 	act.substream	= NULL;
 	act.tail	= 0;
 	act.size	= 0;
 	act.state_change_notify = false;
 	pcm.state	= substream->runtime->_STATE_;
+
 
 	/* Some playback software may perform CLOSE and then reOPEN between songs.
 	 * In this case, if there are no changes in format or sample rate,
@@ -252,7 +267,7 @@ static int vsound_pcm_hw_free(struct snd_pcm_substream *substream)
 
 static int vsound_pcm_close(struct snd_pcm_substream *substream)
 {
-	LOG("CLOSE");
+	LOG("CLOSE drain:%ld xrun:%ld", drain_count, xrun_count);
 	/* private data */
 	struct vsound_data *data;
 	data = substream->runtime->private_data;
@@ -260,7 +275,6 @@ static int vsound_pcm_close(struct snd_pcm_substream *substream)
 		kfree(data);
 
 	pcm.state		= substream->runtime->_STATE_;
-	act.substream	= NULL;
 	return 0;
 }
 
@@ -452,6 +466,17 @@ static int vsound_buffer_open(struct inode* inode __attribute__ ((unused)), stru
 	return 0;
 }
 
+ssize_t actual_hw_avail_bytes(struct snd_pcm_runtime *runtime)
+{
+	snd_pcm_sframes_t avail = runtime->hw_ptr_base + bytes_to_frames(runtime, act.tail)
+		+ runtime->buffer_size - runtime->control->appl_ptr;
+	if (avail < 0)
+		avail += runtime->boundary;
+	else if ((snd_pcm_uframes_t) avail >= runtime->boundary)
+		avail -= runtime->boundary;
+	return frames_to_bytes(runtime, runtime->buffer_size - avail);
+}
+
 static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, loff_t* pos __attribute__ ((unused)))
 {
 	/* read stats, return avail bytes */
@@ -489,18 +514,14 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 	unsigned int tail = act.tail;
 	unsigned int buffer_bytes = frames_to_bytes(runtime, runtime->buffer_size);
 
-	snd_pcm_sframes_t avail = snd_pcm_playback_hw_avail(runtime);
-	if (likely(avail > 0)) {
-		avail = frames_to_bytes(runtime, avail);
-	} else {
-		if (runtime->_STATE_ == SNDRV_PCM_STATE_DRAINING) {
-			return 0;
-		} else {
-			return -EAGAIN;
-		}
-	}
-	if (unlikely(count > avail)) {
+	ssize_t avail = actual_hw_avail_bytes(runtime);
+	if (avail == 0) {
+		snd_pcm_stop_xrun(act.substream);
+		xrun_count++;
+		return -EAGAIN;
+	} else if (avail < count) {
 		count = avail;
+		drain_count++;
 	}
 
 	if (tail + count >= buffer_bytes) {
@@ -518,11 +539,12 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 	act.size += bytes_to_frames(runtime, count);
 	if (act.size >= runtime->period_size) {
 		act.size %= runtime->period_size;
-		snd_pcm_period_elapsed(act.substream);
+		queue_work(system_highpri_wq, &period_elapsed_work);
 	}
 
 	return count;
 }
+
 static int vsound_buffer_release(struct inode* inode __attribute__ ((unused)), struct file* filp __attribute__ ((unused)))
 {
 	return 0;
@@ -630,6 +652,8 @@ static void __exit alsa_card_vsound_exit(void)
 	}
 	if (chardev) cdev_del(chardev);
 	unregister_chrdev_region(start, 1);
+
+	cancel_work_sync(&period_elapsed_work);
 }
 
 module_init(alsa_card_vsound_init)
