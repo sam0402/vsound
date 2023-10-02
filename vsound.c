@@ -1,9 +1,7 @@
 #include <linux/version.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <linux/interrupt.h>
 #include <linux/module.h>
-#include <linux/sched.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
@@ -45,7 +43,7 @@ MODULE_PARM_DESC(pcm_devs, "PCM devices # (0-4) for vsound driver.");
 module_param_array(pcm_substreams, int, NULL, 0444);
 MODULE_PARM_DESC(pcm_substreams, "PCM substreams # (1-128) for vsound driver.");
 
-static int period_bytes_min = 371;
+static int period_bytes_min = 372;
 static int periods_min = 4;
 module_param(period_bytes_min, int, S_IRUSR | S_IWUSR);
 module_param(periods_min, int, S_IRUSR | S_IWUSR);
@@ -95,13 +93,6 @@ static struct active_buffer act;
 static struct vsound_pcm pcm;
 static struct vsound_model backend_model = (struct vsound_model){ 0 };
 
-static void period_elapsed_func(struct work_struct *work)
-{
-	if (act.substream)
-		snd_pcm_period_elapsed(act.substream);
-}
-static DECLARE_WORK(period_elapsed_work, period_elapsed_func);
-
 /* default model */
 static const struct snd_pcm_hardware vsound_pcm_hardware = {
 	.info =			(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP_VALID),
@@ -124,7 +115,7 @@ static const struct snd_pcm_hardware vsound_pcm_hardware = {
 	.channels_max =		2,
 	.buffer_bytes_max =	1024*2048,
 	.period_bytes_max =	65536,
-	.period_bytes_min =	371,
+	.period_bytes_min =	372,
 	.periods_min =		4,
 	.periods_max =		256,
 	.fifo_size =		0,
@@ -240,8 +231,6 @@ static snd_pcm_uframes_t vsound_pcm_pointer(struct snd_pcm_substream *substream)
 static int vsound_pcm_hw_free(struct snd_pcm_substream *substream)
 {
 	LOG("HW FREE");
-	cancel_work_sync(&period_elapsed_work);
-
 	act.substream	= NULL;
 	act.tail	= 0;
 	act.size	= 0;
@@ -539,7 +528,7 @@ static ssize_t vsound_buffer_read(struct file* filp, char* buf, size_t count, lo
 	act.size += bytes_to_frames(runtime, count);
 	if (act.size >= runtime->period_size) {
 		act.size %= runtime->period_size;
-		queue_work(system_highpri_wq, &period_elapsed_work);
+		snd_pcm_period_elapsed(act.substream);
 	}
 
 	return count;
@@ -652,8 +641,6 @@ static void __exit alsa_card_vsound_exit(void)
 	}
 	if (chardev) cdev_del(chardev);
 	unregister_chrdev_region(start, 1);
-
-	cancel_work_sync(&period_elapsed_work);
 }
 
 module_init(alsa_card_vsound_init)
